@@ -8,7 +8,6 @@ import "./Oracle.sol";
 
 contract Dogex is ReentrancyGuard, Ownable {
     IERC20 private immutable usdc;
-    IERC20 private immutable doge;
     DogePriceOracle private immutable oracle;
 
     struct Position {
@@ -32,9 +31,8 @@ contract Dogex is ReentrancyGuard, Ownable {
     event LiquidityRemoved(address indexed owner, uint256 amount, uint256 newBalance);
     event PositionLiquidated(address indexed user, uint256 collateral, int256 pnl);
 
-    constructor(address _usdc, address _doge, address _oracle) Ownable(msg.sender) {
+    constructor(address _usdc, address _oracle) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
-        doge = IERC20(_doge);
         oracle = DogePriceOracle(_oracle);
     }
 

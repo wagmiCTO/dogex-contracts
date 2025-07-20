@@ -16,13 +16,3 @@ contract MockUSDC is ERC20 {
         _mint(to, amount);
     }
 }
-
-contract MockDOGE is ERC20 {
-    constructor() ERC20("Mock DOGE", "mDOGE") {
-        _mint(msg.sender, 1000000 * 10**8); // 1M DOGE
-    }
-    
-    function decimals() public pure override returns (uint8) {
-        return 8;
-    }
-}
