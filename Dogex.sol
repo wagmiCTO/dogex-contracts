@@ -4,10 +4,12 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "./Oracle.sol";
 
 contract Dogex is ReentrancyGuard, Ownable {
     IERC20 private immutable usdc;
     IERC20 private immutable doge;
+    DogePriceOracle private immutable oracle;
 
     struct Position {
         uint256 size;
@@ -24,24 +26,16 @@ contract Dogex is ReentrancyGuard, Ownable {
     uint256 private constant MIN_LEVERAGE = 10;
     uint256 private constant LIQUIDATION_THRESHOLD = 90; // 90% of collateral
 
-    // Price management
-    uint256 public currentPrice;
-    uint256 public lastPriceUpdate;
-    uint256 private constant MAX_PRICE_CHANGE_PERCENT = 10;
-    uint256 private constant PRICE_UPDATE_COOLDOWN = 0 minutes;
-
-    event PriceUpdated(uint256 oldPrice, uint256 newPrice, uint256 timestamp);
     event PositionOpened(address indexed user, uint256 size, uint256 collateral, uint256 entryPrice, bool isLong);
     event PositionClosed(address indexed user, int256 pnl, uint256 finalAmount);
     event LiquidityAdded(address indexed owner, uint256 amount, uint256 newBalance);
     event LiquidityRemoved(address indexed owner, uint256 amount, uint256 newBalance);
     event PositionLiquidated(address indexed user, uint256 collateral, int256 pnl);
 
-    constructor(address _usdc, address _doge) Ownable(msg.sender) {
+    constructor(address _usdc, address _doge, address _oracle) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
         doge = IERC20(_doge);
-        currentPrice = 7 * PRECISION; // Initial DOGE price: $0.07
-        lastPriceUpdate = block.timestamp;
+        oracle = DogePriceOracle(_oracle);
     }
 
     function openPosition(
@@ -102,41 +96,8 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     //PRICE MANAGEMENT
     function getCurrentPrice() public view returns (uint256) {
-        if (currentPrice == 0) {
-            return 7 * PRECISION;
-        }
-        return currentPrice;
-    }
-
-    function updatePrice(uint256 _newPrice) external onlyOwner {
-        require(_newPrice > 0, "Price must be greater than 0");
-        require(block.timestamp >= lastPriceUpdate + PRICE_UPDATE_COOLDOWN, "Price update cooldown");
-
-        uint256 oldPrice = currentPrice;
-
-        currentPrice = _newPrice;
-        lastPriceUpdate = block.timestamp;
-
-        emit PriceUpdated(oldPrice, _newPrice, block.timestamp);
-    }
-
-    function simulatePriceMovement(bool _increase) external onlyOwner {
-        require(block.timestamp >= lastPriceUpdate + PRICE_UPDATE_COOLDOWN, "Price update cooldown");
-
-        uint256 oldPrice = currentPrice;
-        uint256 changePercent = 2;
-        uint256 priceChange = (currentPrice * changePercent) / 100;
-
-        if (_increase) {
-            currentPrice = currentPrice + priceChange;
-        } else {
-            require(currentPrice > priceChange, "Price cannot go below zero");
-            currentPrice = currentPrice - priceChange;
-        }
-
-        lastPriceUpdate = block.timestamp;
-
-        emit PriceUpdated(oldPrice, currentPrice, block.timestamp);
+        (uint256 price, ) = oracle.getDogePrice();
+        return price;
     }
     //END OF PRICE MANAGEMENT
 
