@@ -20,6 +20,10 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     mapping(address => Position) public positions;
 
+    mapping(uint256 => address) public activePositions;
+    mapping(address => uint256) public positionIndex;
+    uint256 public activePositionCount;
+
     uint256 private constant PRECISION = 1e18;
     uint256 private constant MAX_LEVERAGE = 100;
     uint256 private constant MIN_LEVERAGE = 10;
@@ -30,53 +34,57 @@ contract Dogex is ReentrancyGuard, Ownable {
     event LiquidityAdded(address indexed owner, uint256 amount, uint256 newBalance);
     event LiquidityRemoved(address indexed owner, uint256 amount, uint256 newBalance);
     event PositionLiquidated(address indexed user, uint256 collateral, int256 pnl);
+    event BatchLiquidation(address[] liquidatedUsers, uint256 totalLiquidated);
 
     constructor(address _usdc, address _oracle) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
         oracle = DogePriceOracle(_oracle);
     }
 
-    function openPosition(
-        uint256 _collateralAmount,
-        uint256 _sizeDelta,
-        bool _isLong
-    ) external nonReentrant {
-        require(!positions[msg.sender].isActive, "Position already exists");
-        require(_sizeDelta <= _collateralAmount * MAX_LEVERAGE, "Leverage too high");
-        require(_sizeDelta >= _collateralAmount * MIN_LEVERAGE, "Leverage too low");
+     function openPosition(
+         uint256 _collateralAmount,
+         uint256 _sizeDelta,
+         bool _isLong
+     ) external nonReentrant {
+         require(!positions[msg.sender].isActive, "Position already exists");
+         require(_sizeDelta <= _collateralAmount * MAX_LEVERAGE, "Leverage too high");
+         require(_sizeDelta >= _collateralAmount * MIN_LEVERAGE, "Leverage too low");
 
-        usdc.transferFrom(msg.sender, address(this), _collateralAmount);
+         usdc.transferFrom(msg.sender, address(this), _collateralAmount);
 
-        uint256 entryPrice = getCurrentPrice();
+         uint256 entryPrice = getCurrentPrice();
 
-        positions[msg.sender] = Position({
-            size: _sizeDelta,
-            collateral: _collateralAmount,
-            entryPrice: entryPrice,
-            isLong: _isLong,
-            isActive: true
-        });
+         positions[msg.sender] = Position({
+             size: _sizeDelta,
+             collateral: _collateralAmount,
+             entryPrice: entryPrice,
+             isLong: _isLong,
+             isActive: true
+         });
 
-        emit PositionOpened(msg.sender, _sizeDelta, _collateralAmount, entryPrice, _isLong);
-    }
+         _addToActivePositions(msg.sender); // Add this line
 
-    function closePosition() external nonReentrant {
-        Position storage position = positions[msg.sender];
-        require(position.isActive, "No active position");
+         emit PositionOpened(msg.sender, _sizeDelta, _collateralAmount, entryPrice, _isLong);
+     }
 
-        uint256 currentPriceNow = getCurrentPrice();
-        int256 pnl = calculatePnL(position, currentPriceNow);
+     function closePosition() external nonReentrant {
+         Position storage position = positions[msg.sender];
+         require(position.isActive, "No active position");
 
-        uint256 finalAmount = uint256(int256(position.collateral) + pnl);
+         uint256 currentPriceNow = getCurrentPrice();
+         int256 pnl = calculatePnL(position, currentPriceNow);
 
-        position.isActive = false;
+         uint256 finalAmount = uint256(int256(position.collateral) + pnl);
 
-        if (finalAmount > 0) {
-            usdc.transfer(msg.sender, finalAmount);
-        }
+         position.isActive = false;
+         _removeFromActivePositions(msg.sender); // Add this line
 
-        emit PositionClosed(msg.sender, pnl, finalAmount);
-    }
+         if (finalAmount > 0) {
+             usdc.transfer(msg.sender, finalAmount);
+         }
+
+         emit PositionClosed(msg.sender, pnl, finalAmount);
+     }
 
     function calculatePnL(Position memory _position, uint256 _currentPrice)
     internal
@@ -175,6 +183,9 @@ contract Dogex is ReentrancyGuard, Ownable {
         });
     }
 
+
+    //LIQUIDATION FUNCTIONS
+
     /**
      * @notice Checks if a position can be liquidated
      * @param _user Address of the position owner
@@ -231,5 +242,140 @@ contract Dogex is ReentrancyGuard, Ownable {
         }
 
         emit PositionLiquidated(_user, position.collateral, pnl);
+    }
+
+        /**
+     * @notice Adds position to active tracking when opened
+     */
+    function _addToActivePositions(address user) internal {
+        positionIndex[user] = activePositionCount;
+        activePositions[activePositionCount] = user;
+        activePositionCount++;
+    }
+
+    /**
+     * @notice Removes position from active tracking when closed/liquidated
+     */
+    function _removeFromActivePositions(address user) internal {
+        uint256 index = positionIndex[user];
+        uint256 lastIndex = activePositionCount - 1;
+
+        if (index != lastIndex) {
+            address lastUser = activePositions[lastIndex];
+            activePositions[index] = lastUser;
+            positionIndex[lastUser] = index;
+        }
+
+        delete activePositions[lastIndex];
+        delete positionIndex[user];
+        activePositionCount--;
+    }
+
+    /**
+     * @notice Batch liquidate multiple positions at once
+     * @param maxLiquidations Maximum number of positions to liquidate in one call
+     * @return liquidatedCount Number of positions actually liquidated
+     */
+    function batchLiquidate(uint256 maxLiquidations) external nonReentrant returns (uint256 liquidatedCount) {
+        require(maxLiquidations > 0 && maxLiquidations <= 50, "Invalid batch size");
+
+        address[] memory liquidatedUsers = new address[](maxLiquidations);
+        uint256 currentPrice = getCurrentPrice();
+
+        uint256 i = 0;
+        uint256 processed = 0;
+
+        while (processed < activePositionCount && liquidatedCount < maxLiquidations) {
+            address user = activePositions[i];
+            Position storage position = positions[user];
+
+            if (position.isActive) {
+                int256 pnl = calculatePnL(position, currentPrice);
+
+                // Check if liquidatable
+                if (pnl < 0 && uint256(-pnl) >= position.collateral * LIQUIDATION_THRESHOLD / 100) {
+                    liquidatedUsers[liquidatedCount] = user;
+                    _executeLiquidation(user, position, pnl);
+                    liquidatedCount++;
+                }
+            }
+
+            processed++;
+            i = (i + 1) % activePositionCount;
+        }
+
+        if (liquidatedCount > 0) {
+            // Resize array to actual liquidated count
+            assembly {
+                mstore(liquidatedUsers, liquidatedCount)
+            }
+            emit BatchLiquidation(liquidatedUsers, liquidatedCount);
+        }
+
+        return liquidatedCount;
+    }
+
+    /**
+     * @notice Internal function to execute liquidation
+     */
+    function _executeLiquidation(address user, Position storage position, int256 pnl) internal {
+        position.isActive = false;
+        _removeFromActivePositions(user);
+
+        // Calculate liquidator fee and user refund
+        uint256 remainingCollateral = 0;
+        if (uint256(-pnl) < position.collateral) {
+            remainingCollateral = position.collateral - uint256(-pnl);
+
+            uint256 liquidatorFee = remainingCollateral * 5 / 100;
+            uint256 userRefund = remainingCollateral - liquidatorFee;
+
+            if (liquidatorFee > 0) {
+                usdc.transfer(msg.sender, liquidatorFee);
+            }
+
+            if (userRefund > 0) {
+                usdc.transfer(user, userRefund);
+            }
+        }
+
+        emit PositionLiquidated(user, position.collateral, pnl);
+    }
+
+    /**
+     * @notice Get all liquidatable positions (for external monitoring)
+     * @param maxCheck Maximum positions to check
+     * @return liquidatableUsers Array of users with liquidatable positions
+     */
+    function getLiquidatablePositions(uint256 maxCheck) external view returns (address[] memory liquidatableUsers) {
+        require(maxCheck > 0 && maxCheck <= 100, "Invalid check limit");
+
+        address[] memory temp = new address[](maxCheck);
+        uint256 liquidatableCount = 0;
+        uint256 currentPrice = getCurrentPrice();
+
+        uint256 toCheck = maxCheck > activePositionCount ? activePositionCount : maxCheck;
+
+        for (uint256 i = 0; i < toCheck; i++) {
+            address user = activePositions[i];
+            Position memory position = positions[user];
+
+            if (position.isActive) {
+                int256 pnl = calculatePnL(position, currentPrice);
+
+                if (pnl < 0 && uint256(-pnl) >= position.collateral * LIQUIDATION_THRESHOLD / 100) {
+                    temp[liquidatableCount] = user;
+                    liquidatableCount++;
+                }
+            }
+        }
+
+        // Resize array to actual count
+        liquidatableUsers = new address[](liquidatableCount);
+        for (uint256 i = 0; i < liquidatableCount; i++) {
+            liquidatableUsers[i] = temp[i];
+        }
+
+        return liquidatableUsers;
     }
 }
