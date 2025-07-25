@@ -220,15 +220,13 @@ contract Dogex is ReentrancyGuard, Ownable {
         uint256 currentPriceNow = getCurrentPrice();
         int256 pnl = calculatePnL(position, currentPriceNow);
 
-        // Mark position as inactive
         position.isActive = false;
+        _removeFromActivePositions(_user); // Add this line
 
-        // Calculate remaining collateral (if any)
         uint256 remainingCollateral = 0;
         if (uint256(-pnl) < position.collateral) {
             remainingCollateral = position.collateral - uint256(-pnl);
 
-            // Send 5% of remaining collateral to liquidator
             uint256 liquidatorFee = remainingCollateral * 5 / 100;
             uint256 userRefund = remainingCollateral - liquidatorFee;
 
@@ -276,44 +274,40 @@ contract Dogex is ReentrancyGuard, Ownable {
      * @param maxLiquidations Maximum number of positions to liquidate in one call
      * @return liquidatedCount Number of positions actually liquidated
      */
-    function batchLiquidate(uint256 maxLiquidations) external nonReentrant returns (uint256 liquidatedCount) {
-        require(maxLiquidations > 0 && maxLiquidations <= 50, "Invalid batch size");
+   function batchLiquidate(uint256 maxLiquidations) external nonReentrant returns (uint256 liquidatedCount) {
+       require(maxLiquidations > 0 && maxLiquidations <= 50, "Invalid batch size");
 
-        address[] memory liquidatedUsers = new address[](maxLiquidations);
-        uint256 currentPrice = getCurrentPrice();
+       address[] memory liquidatedUsers = new address[](maxLiquidations);
+       uint256 currentPrice = getCurrentPrice();
 
-        uint256 i = 0;
-        uint256 processed = 0;
+       uint256 i = activePositionCount;
 
-        while (processed < activePositionCount && liquidatedCount < maxLiquidations) {
-            address user = activePositions[i];
-            Position storage position = positions[user];
+       while (i > 0 && liquidatedCount < maxLiquidations) {
+           i--;
+           address user = activePositions[i];
+           Position storage position = positions[user];
 
-            if (position.isActive) {
-                int256 pnl = calculatePnL(position, currentPrice);
+           if (position.isActive) {
+               int256 pnl = calculatePnL(position, currentPrice);
 
-                // Check if liquidatable
-                if (pnl < 0 && uint256(-pnl) >= position.collateral * LIQUIDATION_THRESHOLD / 100) {
-                    liquidatedUsers[liquidatedCount] = user;
-                    _executeLiquidation(user, position, pnl);
-                    liquidatedCount++;
-                }
-            }
+               if (pnl < 0 && uint256(-pnl) >= position.collateral * LIQUIDATION_THRESHOLD / 100) {
+                   liquidatedUsers[liquidatedCount] = user;
+                   _executeLiquidation(user, position, pnl);
+                   liquidatedCount++;
+               }
+           }
+       }
 
-            processed++;
-            i = (i + 1) % activePositionCount;
-        }
+       if (liquidatedCount > 0) {
+           // Resize array to actual liquidated count
+           assembly {
+               mstore(liquidatedUsers, liquidatedCount)
+           }
+           emit BatchLiquidation(liquidatedUsers, liquidatedCount);
+       }
 
-        if (liquidatedCount > 0) {
-            // Resize array to actual liquidated count
-            assembly {
-                mstore(liquidatedUsers, liquidatedCount)
-            }
-            emit BatchLiquidation(liquidatedUsers, liquidatedCount);
-        }
-
-        return liquidatedCount;
-    }
+       return liquidatedCount;
+   }
 
     /**
      * @notice Internal function to execute liquidation
