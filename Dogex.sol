@@ -25,9 +25,11 @@ contract Dogex is ReentrancyGuard, Ownable {
     uint256 public activePositionCount;
 
     uint256 private constant PRECISION = 1e18;
-    uint256 private constant MAX_LEVERAGE = 100;
+    uint256 private constant MAX_LEVERAGE = 200;
     uint256 private constant MIN_LEVERAGE = 10;
     uint256 private constant LIQUIDATION_THRESHOLD = 90; // 90% of collateral
+    uint256 private constant MIN_COLLATERAL = 1e6; // 1 USDC
+    uint256 private constant MAX_COLLATERAL = 1000e6; // 100 USDC
 
     event PositionOpened(address indexed user, uint256 size, uint256 collateral, uint256 entryPrice, bool isLong);
     event PositionClosed(address indexed user, int256 pnl, uint256 finalAmount);
@@ -49,6 +51,8 @@ contract Dogex is ReentrancyGuard, Ownable {
          require(!positions[msg.sender].isActive, "Position already exists");
          require(_sizeDelta <= _collateralAmount * MAX_LEVERAGE, "Leverage too high");
          require(_sizeDelta >= _collateralAmount * MIN_LEVERAGE, "Leverage too low");
+         require(_collateralAmount >= MIN_COLLATERAL, "Collateral below minimum");
+         require(_collateralAmount <= MAX_COLLATERAL, "Collateral above maximum");
 
          usdc.transferFrom(msg.sender, address(this), _collateralAmount);
 
