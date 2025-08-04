@@ -6,10 +6,30 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Oracle.sol";
 
+/**
+ * @title Dogex
+ * @notice A decentralized derivatives exchange for trading Dogecoin (DOGE) with leverage
+ * @dev This contract allows users to open leveraged long/short positions on DOGE using USDC as collateral.
+ *      It includes features for position management, liquidations, and liquidity management.
+ *      The contract uses an external oracle for DOGE price feeds and implements safety mechanisms
+ *      including liquidation thresholds and leverage limits.
+ * @author Dogex Team
+ */
 contract Dogex is ReentrancyGuard, Ownable {
+    /// @notice USDC token contract used as collateral
     IERC20 private immutable usdc;
+
+    /// @notice Oracle contract for DOGE price feeds
     DogePriceOracle private immutable oracle;
 
+    /**
+     * @notice Represents a trading position
+     * @param size The notional size of the position in USDC terms
+     * @param collateral The amount of USDC collateral deposited
+     * @param entryPrice The DOGE price when the position was opened
+     * @param isLong True for long positions, false for short positions
+     * @param isActive Whether the position is currently active
+     */
     struct Position {
         uint256 size;
         uint256 collateral;
@@ -18,31 +38,108 @@ contract Dogex is ReentrancyGuard, Ownable {
         bool isActive;
     }
 
+    /// @notice Mapping from user address to their position
     mapping(address => Position) public positions;
 
+    /// @notice Mapping from index to user address for active position tracking
     mapping(uint256 => address) public activePositions;
+
+    /// @notice Mapping from user address to their index in activePositions array
     mapping(address => uint256) public positionIndex;
+
+    /// @notice Total number of active positions
     uint256 public activePositionCount;
 
+    /// @notice Precision constant for calculations (18 decimals)
     uint256 private constant PRECISION = 1e18;
-    uint256 private constant MAX_LEVERAGE = 200;
-    uint256 private constant MIN_LEVERAGE = 10;
-    uint256 private constant LIQUIDATION_THRESHOLD = 90; // 90% of collateral
-    uint256 private constant MIN_COLLATERAL = 1e6; // 1 USDC
-    uint256 private constant MAX_COLLATERAL = 1000e6; // 100 USDC
 
+    /// @notice Maximum allowed leverage (200x)
+    uint256 private constant MAX_LEVERAGE = 200;
+
+    /// @notice Minimum allowed leverage (10x)
+    uint256 private constant MIN_LEVERAGE = 10;
+
+    /// @notice Liquidation threshold as percentage of collateral (90%)
+    uint256 private constant LIQUIDATION_THRESHOLD = 90;
+
+    /// @notice Minimum collateral amount (1 USDC)
+    uint256 private constant MIN_COLLATERAL = 1e6;
+
+    /// @notice Maximum collateral amount (1000 USDC)
+    uint256 private constant MAX_COLLATERAL = 1000e6;
+
+    /**
+     * @notice Emitted when a new position is opened
+     * @param user The address of the user who opened the position
+     * @param size The notional size of the position
+     * @param collateral The amount of collateral deposited
+     * @param entryPrice The DOGE price at position opening
+     * @param isLong True if it's a long position, false if short
+     */
     event PositionOpened(address indexed user, uint256 size, uint256 collateral, uint256 entryPrice, bool isLong);
+
+    /**
+     * @notice Emitted when a position is closed
+     * @param user The address of the user who closed the position
+     * @param pnl The profit/loss of the position (positive for profit, negative for loss)
+     * @param finalAmount The final amount returned to the user
+     */
     event PositionClosed(address indexed user, int256 pnl, uint256 finalAmount);
+
+    /**
+     * @notice Emitted when liquidity is added to the contract
+     * @param owner The address that added liquidity
+     * @param amount The amount of USDC added
+     * @param newBalance The new total balance after addition
+     */
     event LiquidityAdded(address indexed owner, uint256 amount, uint256 newBalance);
+
+    /**
+     * @notice Emitted when liquidity is removed from the contract
+     * @param owner The address that removed liquidity
+     * @param amount The amount of USDC removed
+     * @param newBalance The new total balance after removal
+     */
     event LiquidityRemoved(address indexed owner, uint256 amount, uint256 newBalance);
+
+    /**
+     * @notice Emitted when a position is liquidated
+     * @param user The address of the user whose position was liquidated
+     * @param collateral The original collateral amount
+     * @param pnl The profit/loss at liquidation
+     */
     event PositionLiquidated(address indexed user, uint256 collateral, int256 pnl);
+
+    /**
+     * @notice Emitted when multiple positions are liquidated in a batch
+     * @param liquidatedUsers Array of user addresses that were liquidated
+     * @param totalLiquidated The total number of positions liquidated
+     */
     event BatchLiquidation(address[] liquidatedUsers, uint256 totalLiquidated);
 
+    /**
+     * @notice Initializes the Dogex contract
+     * @param _usdc Address of the USDC token contract
+     * @param _oracle Address of the DOGE price oracle contract
+     */
     constructor(address _usdc, address _oracle) Ownable(msg.sender) {
         usdc = IERC20(_usdc);
         oracle = DogePriceOracle(_oracle);
     }
 
+    /**
+     * @notice Opens a new leveraged position on DOGE
+     * @dev Users can only have one active position at a time. The function validates leverage
+     *      limits, collateral bounds, and transfers USDC from the user as collateral.
+     * @param _collateralAmount Amount of USDC to deposit as collateral (must be between MIN_COLLATERAL and MAX_COLLATERAL)
+     * @param _sizeDelta The notional size of the position (determines leverage when combined with collateral)
+     * @param _isLong True to open a long position (bet on price increase), false for short (bet on price decrease)
+     * @custom:requirements
+     * - User must not have an existing active position
+     * - Leverage must be between MIN_LEVERAGE (10x) and MAX_LEVERAGE (200x)
+     * - Collateral must be between 1 and 1000 USDC
+     * - User must have sufficient USDC balance and allowance
+     */
      function openPosition(
          uint256 _collateralAmount,
          uint256 _sizeDelta,
@@ -66,11 +163,19 @@ contract Dogex is ReentrancyGuard, Ownable {
              isActive: true
          });
 
-         _addToActivePositions(msg.sender); // Add this line
+         _addToActivePositions(msg.sender);
 
          emit PositionOpened(msg.sender, _sizeDelta, _collateralAmount, entryPrice, _isLong);
      }
 
+    /**
+     * @notice Closes the caller's active position
+     * @dev Calculates current PnL based on current DOGE price and returns the final amount to the user.
+     *      If the final amount is positive, USDC is transferred back to the user.
+     * @custom:requirements
+     * - User must have an active position
+     * - Contract must have sufficient USDC balance if position is profitable
+     */
      function closePosition() external nonReentrant {
          Position storage position = positions[msg.sender];
          require(position.isActive, "No active position");
@@ -81,7 +186,7 @@ contract Dogex is ReentrancyGuard, Ownable {
          uint256 finalAmount = uint256(int256(position.collateral) + pnl);
 
          position.isActive = false;
-         _removeFromActivePositions(msg.sender); // Add this line
+         _removeFromActivePositions(msg.sender);
 
          if (finalAmount > 0) {
              usdc.transfer(msg.sender, finalAmount);
@@ -90,6 +195,14 @@ contract Dogex is ReentrancyGuard, Ownable {
          emit PositionClosed(msg.sender, pnl, finalAmount);
      }
 
+    /**
+     * @notice Calculates the profit and loss (PnL) for a given position
+     * @dev PnL is calculated based on the difference between current price and entry price,
+     *      scaled by the position size. For short positions, the price difference is inverted.
+     * @param _position The position struct to calculate PnL for
+     * @param _currentPrice The current DOGE price to use for calculation
+     * @return The PnL in USDC terms (positive for profit, negative for loss)
+     */
     function calculatePnL(Position memory _position, uint256 _currentPrice)
     internal
     pure
@@ -105,6 +218,12 @@ contract Dogex is ReentrancyGuard, Ownable {
     }
 
     //PRICE MANAGEMENT
+
+    /**
+     * @notice Gets the current DOGE price from the oracle
+     * @dev Fetches the latest DOGE price from the connected oracle contract
+     * @return The current DOGE price
+     */
     function getCurrentPrice() public view returns (uint256) {
         (uint256 price, ) = oracle.getDogePrice();
         return price;
@@ -153,11 +272,25 @@ contract Dogex is ReentrancyGuard, Ownable {
         emit LiquidityRemoved(msg.sender, balance, 0);
     }
 
+    /**
+     * @notice Get the current USDC balance of the contract
+     * @dev Returns the total USDC liquidity available in the contract
+     * @return The USDC balance of the contract
+     */
     function getContractLiquidityBalance() external view returns (uint256) {
         return usdc.balanceOf(address(this));
     }
     // END OF LIQUIDITY MANAGEMENT
 
+    /**
+     * @notice Extended position struct that includes current PnL
+     * @param size The notional size of the position
+     * @param collateral The amount of collateral deposited
+     * @param entryPrice The entry price of the position
+     * @param isLong True for long positions, false for short
+     * @param isActive Whether the position is currently active
+     * @param pnl The current profit/loss of the position
+     */
     struct PositionWithPnL {
         uint256 size;
         uint256 collateral;
@@ -168,6 +301,12 @@ contract Dogex is ReentrancyGuard, Ownable {
     }
 
     // TESTING FUNCTIONS
+    /**
+     * @notice Get a user's position with current PnL calculated
+     * @dev This function is useful for frontend applications to display current position status
+     * @param user The address of the user whose position to retrieve
+     * @return A PositionWithPnL struct containing all position data including current PnL
+     */
     function getPosition(address user) external view returns (PositionWithPnL memory) {
         Position memory position = positions[user];
         int256 currentPnl = 0;
@@ -225,7 +364,7 @@ contract Dogex is ReentrancyGuard, Ownable {
         int256 pnl = calculatePnL(position, currentPriceNow);
 
         position.isActive = false;
-        _removeFromActivePositions(_user); // Add this line
+        _removeFromActivePositions(_user);
 
         uint256 remainingCollateral = 0;
         if (uint256(-pnl) < position.collateral) {
@@ -246,8 +385,10 @@ contract Dogex is ReentrancyGuard, Ownable {
         emit PositionLiquidated(_user, position.collateral, pnl);
     }
 
-        /**
+    /**
      * @notice Adds position to active tracking when opened
+     * @dev Internal function to manage the activePositions array and positionIndex mapping
+     * @param user The user address to add to active position tracking
      */
     function _addToActivePositions(address user) internal {
         positionIndex[user] = activePositionCount;
@@ -257,6 +398,9 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /**
      * @notice Removes position from active tracking when closed/liquidated
+     * @dev Internal function that efficiently removes a position from tracking by swapping
+     *      with the last element and decrementing the count
+     * @param user The user address to remove from active position tracking
      */
     function _removeFromActivePositions(address user) internal {
         uint256 index = positionIndex[user];
@@ -275,7 +419,9 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /**
      * @notice Batch liquidate multiple positions at once
-     * @param maxLiquidations Maximum number of positions to liquidate in one call
+     * @dev Efficiently liquidates multiple positions in a single transaction to save gas.
+     *      Iterates through active positions and liquidates those that meet the criteria.
+     * @param maxLiquidations Maximum number of positions to liquidate in one call (capped at 50)
      * @return liquidatedCount Number of positions actually liquidated
      */
    function batchLiquidate(uint256 maxLiquidations) external nonReentrant returns (uint256 liquidatedCount) {
@@ -315,6 +461,10 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /**
      * @notice Internal function to execute liquidation
+     * @dev Handles the liquidation process including fee calculation and fund distribution
+     * @param user The address of the user being liquidated
+     * @param position The position being liquidated (storage reference for gas efficiency)
+     * @param pnl The current profit/loss of the position
      */
     function _executeLiquidation(address user, Position storage position, int256 pnl) internal {
         position.isActive = false;
@@ -342,7 +492,9 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /**
      * @notice Get all liquidatable positions (for external monitoring)
-     * @param maxCheck Maximum positions to check
+     * @dev Useful for liquidation bots and monitoring systems to identify positions
+     *      that can be liquidated. Limited to prevent gas issues.
+     * @param maxCheck Maximum positions to check (capped at 100)
      * @return liquidatableUsers Array of users with liquidatable positions
      */
     function getLiquidatablePositions(uint256 maxCheck) external view returns (address[] memory liquidatableUsers) {
