@@ -255,7 +255,6 @@ contract Dogex is ReentrancyGuard, Ownable {
     function addLiquidity(uint256 _amount) external onlyOwner {
         require(_amount > 0, "Amount must be greater than 0");
 
-        uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.transferFrom(msg.sender, address(this), _amount);
         uint256 balanceAfter = usdc.balanceOf(address(this));
 
@@ -270,7 +269,6 @@ contract Dogex is ReentrancyGuard, Ownable {
         require(_amount > 0, "Amount must be greater than 0");
         require(usdc.balanceOf(address(this)) >= _amount, "Insufficient vault balance");
 
-        uint256 balanceBefore = usdc.balanceOf(address(this));
         usdc.transfer(msg.sender, _amount);
         uint256 balanceAfter = usdc.balanceOf(address(this));
 
