@@ -61,8 +61,8 @@ contract Dogex is ReentrancyGuard, Ownable {
     /// @notice Precision constant for calculations (18 decimals)
     uint256 private constant PRECISION = 1e18;
 
-    /// @notice Maximum allowed leverage (200x)
-    uint256 private constant MAX_LEVERAGE = 200;
+    /// @notice Maximum allowed leverage (1000x)
+    uint256 private constant MAX_LEVERAGE = 1000;
 
     /// @notice Minimum allowed leverage (10x)
     uint256 private constant MIN_LEVERAGE = 10;
