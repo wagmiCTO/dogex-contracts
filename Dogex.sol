@@ -24,6 +24,7 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /**
      * @notice Represents a trading position
+     * @param id Unique identifier for the position
      * @param size The notional size of the position in USDC terms
      * @param collateral The amount of USDC collateral deposited
      * @param entryPrice The DOGE price when the position was opened
@@ -31,6 +32,7 @@ contract Dogex is ReentrancyGuard, Ownable {
      * @param isActive Whether the position is currently active
      */
     struct Position {
+        uint256 id;
         uint256 size;
         uint256 collateral;
         uint256 entryPrice;
@@ -40,6 +42,12 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /// @notice Mapping from user address to their position
     mapping(address => Position) public positions;
+
+    /// @notice Mapping from position ID to user address for reverse lookup
+    mapping(uint256 => address) public positionIdToUser;
+
+    /// @notice Counter for generating unique position IDs
+    uint256 private nextPositionId = 1;
 
     /// @notice Mapping from index to user address for active position tracking
     mapping(uint256 => address) public activePositions;
@@ -71,20 +79,22 @@ contract Dogex is ReentrancyGuard, Ownable {
     /**
      * @notice Emitted when a new position is opened
      * @param user The address of the user who opened the position
+     * @param positionId The unique ID assigned to the position
      * @param size The notional size of the position
      * @param collateral The amount of collateral deposited
      * @param entryPrice The DOGE price at position opening
      * @param isLong True if it's a long position, false if short
      */
-    event PositionOpened(address indexed user, uint256 size, uint256 collateral, uint256 entryPrice, bool isLong);
+    event PositionOpened(address indexed user, uint256 indexed positionId, uint256 size, uint256 collateral, uint256 entryPrice, bool isLong);
 
     /**
      * @notice Emitted when a position is closed
      * @param user The address of the user who closed the position
+     * @param positionId The unique ID of the closed position
      * @param pnl The profit/loss of the position (positive for profit, negative for loss)
      * @param finalAmount The final amount returned to the user
      */
-    event PositionClosed(address indexed user, int256 pnl, uint256 finalAmount);
+    event PositionClosed(address indexed user, uint256 indexed positionId, int256 pnl, uint256 finalAmount);
 
     /**
      * @notice Emitted when liquidity is added to the contract
@@ -105,10 +115,11 @@ contract Dogex is ReentrancyGuard, Ownable {
     /**
      * @notice Emitted when a position is liquidated
      * @param user The address of the user whose position was liquidated
+     * @param positionId The unique ID of the liquidated position
      * @param collateral The original collateral amount
      * @param pnl The profit/loss at liquidation
      */
-    event PositionLiquidated(address indexed user, uint256 collateral, int256 pnl);
+    event PositionLiquidated(address indexed user, uint256 indexed positionId, uint256 collateral, int256 pnl);
 
     /**
      * @notice Emitted when multiple positions are liquidated in a batch
@@ -140,33 +151,38 @@ contract Dogex is ReentrancyGuard, Ownable {
      * - Collateral must be between 1 and 1000 USDC
      * - User must have sufficient USDC balance and allowance
      */
-     function openPosition(
-         uint256 _collateralAmount,
-         uint256 _sizeDelta,
-         bool _isLong
-     ) external nonReentrant {
-         require(!positions[msg.sender].isActive, "Position already exists");
-         require(_sizeDelta <= _collateralAmount * MAX_LEVERAGE, "Leverage too high");
-         require(_sizeDelta >= _collateralAmount * MIN_LEVERAGE, "Leverage too low");
-         require(_collateralAmount >= MIN_COLLATERAL, "Collateral below minimum");
-         require(_collateralAmount <= MAX_COLLATERAL, "Collateral above maximum");
+    function openPosition(
+        uint256 _collateralAmount,
+        uint256 _sizeDelta,
+        bool _isLong
+    ) external nonReentrant {
+        require(!positions[msg.sender].isActive, "Position already exists");
+        require(_sizeDelta <= _collateralAmount * MAX_LEVERAGE, "Leverage too high");
+        require(_sizeDelta >= _collateralAmount * MIN_LEVERAGE, "Leverage too low");
+        require(_collateralAmount >= MIN_COLLATERAL, "Collateral below minimum");
+        require(_collateralAmount <= MAX_COLLATERAL, "Collateral above maximum");
 
-         usdc.transferFrom(msg.sender, address(this), _collateralAmount);
+        usdc.transferFrom(msg.sender, address(this), _collateralAmount);
 
-         uint256 entryPrice = getCurrentPrice();
+        uint256 entryPrice = getCurrentPrice();
+        uint256 currentPositionId = nextPositionId;
 
-         positions[msg.sender] = Position({
-             size: _sizeDelta,
-             collateral: _collateralAmount,
-             entryPrice: entryPrice,
-             isLong: _isLong,
-             isActive: true
-         });
+        positions[msg.sender] = Position({
+            id: currentPositionId,
+            size: _sizeDelta,
+            collateral: _collateralAmount,
+            entryPrice: entryPrice,
+            isLong: _isLong,
+            isActive: true
+        });
 
-         _addToActivePositions(msg.sender);
+        positionIdToUser[currentPositionId] = msg.sender;
+        nextPositionId++;
 
-         emit PositionOpened(msg.sender, _sizeDelta, _collateralAmount, entryPrice, _isLong);
-     }
+        _addToActivePositions(msg.sender);
+
+        emit PositionOpened(msg.sender, currentPositionId, _sizeDelta, _collateralAmount, entryPrice, _isLong);
+    }
 
     /**
      * @notice Closes the caller's active position
@@ -176,24 +192,25 @@ contract Dogex is ReentrancyGuard, Ownable {
      * - User must have an active position
      * - Contract must have sufficient USDC balance if position is profitable
      */
-     function closePosition() external nonReentrant {
-         Position storage position = positions[msg.sender];
-         require(position.isActive, "No active position");
+    function closePosition() external nonReentrant {
+        Position storage position = positions[msg.sender];
+        require(position.isActive, "No active position");
 
-         uint256 currentPriceNow = getCurrentPrice();
-         int256 pnl = calculatePnL(position, currentPriceNow);
+        uint256 currentPriceNow = getCurrentPrice();
+        int256 pnl = calculatePnL(position, currentPriceNow);
 
-         uint256 finalAmount = uint256(int256(position.collateral) + pnl);
+        uint256 finalAmount = uint256(int256(position.collateral) + pnl);
+        uint256 positionId = position.id;
 
-         position.isActive = false;
-         _removeFromActivePositions(msg.sender);
+        position.isActive = false;
+        _removeFromActivePositions(msg.sender);
 
-         if (finalAmount > 0) {
-             usdc.transfer(msg.sender, finalAmount);
-         }
+        if (finalAmount > 0) {
+            usdc.transfer(msg.sender, finalAmount);
+        }
 
-         emit PositionClosed(msg.sender, pnl, finalAmount);
-     }
+        emit PositionClosed(msg.sender, positionId, pnl, finalAmount);
+    }
 
     /**
      * @notice Calculates the profit and loss (PnL) for a given position
@@ -284,6 +301,7 @@ contract Dogex is ReentrancyGuard, Ownable {
 
     /**
      * @notice Extended position struct that includes current PnL
+     * @param id Unique identifier for the position
      * @param size The notional size of the position
      * @param collateral The amount of collateral deposited
      * @param entryPrice The entry price of the position
@@ -292,6 +310,7 @@ contract Dogex is ReentrancyGuard, Ownable {
      * @param pnl The current profit/loss of the position
      */
     struct PositionWithPnL {
+        uint256 id;
         uint256 size;
         uint256 collateral;
         uint256 entryPrice;
@@ -300,14 +319,59 @@ contract Dogex is ReentrancyGuard, Ownable {
         int256 pnl;
     }
 
-    // TESTING FUNCTIONS
+    // BACKEND MANAGEMENT FUNCTIONS
+
+    /**
+     * @notice Get a position by its unique ID
+     * @dev This function allows backends to look up positions using the position ID
+     * @param positionId The unique ID of the position
+     * @return A PositionWithPnL struct containing all position data including current PnL
+     */
+    function getPositionById(uint256 positionId) external view returns (PositionWithPnL memory) {
+        address user = positionIdToUser[positionId];
+        require(user != address(0), "Position does not exist");
+
+        return getPosition(user);
+    }
+
+    /**
+     * @notice Get the user address associated with a position ID
+     * @dev Helper function for backend systems to resolve position IDs to user addresses
+     * @param positionId The position ID to look up
+     * @return The user address that owns the position
+     */
+    function getPositionOwner(uint256 positionId) external view returns (address) {
+        return positionIdToUser[positionId];
+    }
+
+    /**
+     * @notice Get the current next position ID that will be assigned
+     * @dev Useful for backend systems to predict the next position ID
+     * @return The next position ID that will be used
+     */
+    function getNextPositionId() external view returns (uint256) {
+        return nextPositionId;
+    }
+
+    /**
+     * @notice Check if a position ID exists and is active
+     * @dev Utility function for backend validation
+     * @param positionId The position ID to check
+     * @return True if the position exists and is active
+     */
+    function isPositionActive(uint256 positionId) external view returns (bool) {
+        address user = positionIdToUser[positionId];
+        if (user == address(0)) return false;
+        return positions[user].isActive;
+    }
+
     /**
      * @notice Get a user's position with current PnL calculated
      * @dev This function is useful for frontend applications to display current position status
      * @param user The address of the user whose position to retrieve
      * @return A PositionWithPnL struct containing all position data including current PnL
      */
-    function getPosition(address user) external view returns (PositionWithPnL memory) {
+    function getPosition(address user) public view returns (PositionWithPnL memory) {
         Position memory position = positions[user];
         int256 currentPnl = 0;
 
@@ -317,6 +381,7 @@ contract Dogex is ReentrancyGuard, Ownable {
         }
 
         return PositionWithPnL({
+            id: position.id,
             size: position.size,
             collateral: position.collateral,
             entryPrice: position.entryPrice,
@@ -325,7 +390,6 @@ contract Dogex is ReentrancyGuard, Ownable {
             pnl: currentPnl
         });
     }
-
 
     //LIQUIDATION FUNCTIONS
 
@@ -362,6 +426,7 @@ contract Dogex is ReentrancyGuard, Ownable {
         Position storage position = positions[_user];
         uint256 currentPriceNow = getCurrentPrice();
         int256 pnl = calculatePnL(position, currentPriceNow);
+        uint256 positionId = position.id;
 
         position.isActive = false;
         _removeFromActivePositions(_user);
@@ -382,7 +447,7 @@ contract Dogex is ReentrancyGuard, Ownable {
             }
         }
 
-        emit PositionLiquidated(_user, position.collateral, pnl);
+        emit PositionLiquidated(_user, positionId, position.collateral, pnl);
     }
 
     /**
@@ -424,40 +489,40 @@ contract Dogex is ReentrancyGuard, Ownable {
      * @param maxLiquidations Maximum number of positions to liquidate in one call (capped at 50)
      * @return liquidatedCount Number of positions actually liquidated
      */
-   function batchLiquidate(uint256 maxLiquidations) external nonReentrant returns (uint256 liquidatedCount) {
-       require(maxLiquidations > 0 && maxLiquidations <= 50, "Invalid batch size");
+    function batchLiquidate(uint256 maxLiquidations) external nonReentrant returns (uint256 liquidatedCount) {
+        require(maxLiquidations > 0 && maxLiquidations <= 50, "Invalid batch size");
 
-       address[] memory liquidatedUsers = new address[](maxLiquidations);
-       uint256 currentPrice = getCurrentPrice();
+        address[] memory liquidatedUsers = new address[](maxLiquidations);
+        uint256 currentPrice = getCurrentPrice();
 
-       uint256 i = activePositionCount;
+        uint256 i = activePositionCount;
 
-       while (i > 0 && liquidatedCount < maxLiquidations) {
-           i--;
-           address user = activePositions[i];
-           Position storage position = positions[user];
+        while (i > 0 && liquidatedCount < maxLiquidations) {
+            i--;
+            address user = activePositions[i];
+            Position storage position = positions[user];
 
-           if (position.isActive) {
-               int256 pnl = calculatePnL(position, currentPrice);
+            if (position.isActive) {
+                int256 pnl = calculatePnL(position, currentPrice);
 
-               if (pnl < 0 && uint256(-pnl) >= position.collateral * LIQUIDATION_THRESHOLD / 100) {
-                   liquidatedUsers[liquidatedCount] = user;
-                   _executeLiquidation(user, position, pnl);
-                   liquidatedCount++;
-               }
-           }
-       }
+                if (pnl < 0 && uint256(-pnl) >= position.collateral * LIQUIDATION_THRESHOLD / 100) {
+                    liquidatedUsers[liquidatedCount] = user;
+                    _executeLiquidation(user, position, pnl);
+                    liquidatedCount++;
+                }
+            }
+        }
 
-       if (liquidatedCount > 0) {
-           // Resize array to actual liquidated count
-           assembly {
-               mstore(liquidatedUsers, liquidatedCount)
-           }
-           emit BatchLiquidation(liquidatedUsers, liquidatedCount);
-       }
+        if (liquidatedCount > 0) {
+            // Resize array to actual liquidated count
+            assembly {
+                mstore(liquidatedUsers, liquidatedCount)
+            }
+            emit BatchLiquidation(liquidatedUsers, liquidatedCount);
+        }
 
-       return liquidatedCount;
-   }
+        return liquidatedCount;
+    }
 
     /**
      * @notice Internal function to execute liquidation
@@ -467,6 +532,8 @@ contract Dogex is ReentrancyGuard, Ownable {
      * @param pnl The current profit/loss of the position
      */
     function _executeLiquidation(address user, Position storage position, int256 pnl) internal {
+        uint256 positionId = position.id;
+
         position.isActive = false;
         _removeFromActivePositions(user);
 
@@ -487,7 +554,7 @@ contract Dogex is ReentrancyGuard, Ownable {
             }
         }
 
-        emit PositionLiquidated(user, position.collateral, pnl);
+        emit PositionLiquidated(user, positionId, position.collateral, pnl);
     }
 
     /**
